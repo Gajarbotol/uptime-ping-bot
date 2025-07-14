@@ -1,0 +1,15 @@
+{
+  "name": "telegram-ping-bot",
+  "version": "1.0.0",
+  "description": "A Telegram bot to automatically ping URLs to keep them active.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
