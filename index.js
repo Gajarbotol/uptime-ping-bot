@@ -1,349 +1,264 @@
-// ✅ Auto Ping Telegram Bot with Full Features + Fail Limit Auto Stop (Fixed & Refactored)
-
+// index.js
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
-const axios = require('axios');
-const http = require('http'); // 👈 Added http module
+const http = require('http');
+const { dbRun, dbGet, dbAll } = require('./database');
+const { startPinger, stopPinger, initializeAllPingers, checkAllSslCertificates } = require('./pinger');
+require('dotenv').config();
 
-// --- CONFIGURATION ---
 const token = process.env.BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID;
-const SELF_PING_URL = process.env.SELF_PING_URL || null; // e.g., your Glitch/Render URL
-const PORT = process.env.PORT || 3000; // 👈 Added port configuration
-const DATA_FILE = './users.json';
-const FAIL_LIMIT = 5; // Auto-stop URL after this many consecutive fails
-const MIN_INTERVAL = 4; // Minimum allowed ping interval in seconds
+const PORT = process.env.PORT || 3000;
 
-// --- INITIALIZATION ---
 const bot = new TelegramBot(token, { polling: true });
+const userStates = new Map();
 
-// --- DATA MANAGEMENT ---
-let users = {};
-try {
-    if (fs.existsSync(DATA_FILE)) {
-        users = JSON.parse(fs.readFileSync(DATA_FILE));
-    }
-} catch (error) {
-    console.error("Error reading data file:", error);
-}
-
-const saveUsers = () => {
-    try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2));
-    } catch (error) {
-        console.error("Error writing data file:", error);
-    }
-};
-
-// In-memory store for active setInterval timers
-const pingIntervals = {};
-
-// --- HELPER FUNCTIONS ---
-
-/**
- * Formats an ISO date string into a relative time format (e.g., "5 minutes ago").
- * @param {string} isoDateString - The ISO date string to format.
- * @returns {string} The formatted relative time.
- */
 function formatTimeAgo(isoDateString) {
-    if (!isoDateString) return 'N/A';
-
-    const now = new Date();
-    const past = new Date(isoDateString);
-    const secondsAgo = Math.round((now - past) / 1000);
-
-    if (secondsAgo < 60) {
-        return `${secondsAgo} second${secondsAgo !== 1 ? 's' : ''} ago`;
-    }
-
-    const minutesAgo = Math.floor(secondsAgo / 60);
-    if (minutesAgo < 60) {
-        return `${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago`;
-    }
-
-    const hoursAgo = Math.floor(minutesAgo / 60);
-    if (hoursAgo < 24) {
-        return `${hoursAgo} hour${hoursAgo !== 1 ? 's' : ''} ago`;
-    }
-
-    const daysAgo = Math.floor(hoursAgo / 24);
-    return `${daysAgo} day${daysAgo !== 1 ? 's' : ''} ago`;
+    if (!isoDateString) return 'Never';
+    const seconds = Math.round((new Date() - new Date(isoDateString)) / 1000);
+    if (seconds < 2) return `Just now`;
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
 }
 
-
-// --- CORE PINGING LOGIC ---
-
-/**
- * Stops a single ping interval for a specific URL.
- * @param {string} userId - The user's ID.
- * @param {number} urlIndex - The index of the URL in the user's array.
- */
-function stopSinglePing(userId, urlIndex) {
-    if (pingIntervals[userId] && pingIntervals[userId][urlIndex]) {
-        clearInterval(pingIntervals[userId][urlIndex]);
-        delete pingIntervals[userId][urlIndex];
-    }
-}
-
-/**
- * Stops all active pings for a given user.
- * @param {string} userId - The user's ID.
- */
-function stopUserPings(userId) {
-    if (pingIntervals[userId]) {
-        for (const urlIndex in pingIntervals[userId]) {
-            clearInterval(pingIntervals[userId][urlIndex]);
+const getMainMenu = (text = "🏠 Main Menu") => ({
+    text,
+    options: {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '➕ Add URL', callback_data: 'add_url' }],
+                [{ text: '📊 My URLs Dashboard', callback_data: 'dashboard' }],
+                [{ text: 'ℹ️ Help', callback_data: 'help' }]
+            ]
         }
-        pingIntervals[userId] = {}; // Clear all intervals for the user
     }
-}
+});
 
-/**
- * Starts pinging all active URLs for a given user.
- * @param {string} userId - The user's ID.
- */
-function startUserPings(userId) {
-    stopUserPings(userId); // Ensure no old intervals are running
+const getDashboardText = async (userId) => {
+    const urls = await dbAll('SELECT * FROM urls WHERE user_id = ? ORDER BY id', [userId]);
+    if (urls.length === 0) {
+        return { text: '🚫 You have no URLs to monitor. Use "Add URL" to start.', options: getMainMenu().options };
+    }
 
-    const user = users[userId];
-    if (!user || !user.urls || !user.urls.length) return;
+    let text = '📊 *Your Monitored URLs:*\n\n';
+    const buttons = [];
+    urls.forEach(u => {
+        const total = u.success_count + u.fail_count;
+        const uptime = total > 0 ? ((u.success_count / total) * 100).toFixed(2) : '100.00';
+        const maintenanceUntil = u.maintenance_until ? new Date(u.maintenance_until) : null;
+        const sslExpiry = u.ssl_expiry_date ? new Date(u.ssl_expiry_date) : null;
+        const sslDays = sslExpiry ? Math.round((sslExpiry - new Date()) / (1000 * 60 * 60 * 24)) : null;
 
-    pingIntervals[userId] = {};
+        text += `*ID:* \`${u.id}\` (${u.is_active ? '🟢 Active' : '🔴 Paused'})\n` +
+                `🔗 ${u.url}\n` +
+                `*Status:* ${u.last_status_code || 'N/A'} | *Latency:* ${u.last_response_time || 'N/A'}ms\n` +
+                `*Uptime:* ${uptime}% | *Interval:* ${u.interval}s\n`;
 
-    user.urls.forEach((entry, index) => {
-        if (!entry.active) return;
+        if (sslDays !== null && sslDays > 0) text += `*SSL Expires:* In ${sslDays} days\n`;
+        else if (sslDays !== null) text += `*SSL Expires:* Expired!\n`;
 
-        // Initialize stats if they don't exist
-        entry.success = entry.success || 0;
-        entry.fail = entry.fail || 0;
-        entry.consecutiveFails = 0; // Reset on start
-
-        const intervalId = setInterval(async () => {
-            try {
-                await axios.get(entry.url);
-                entry.lastPing = new Date().toISOString();
-                entry.success++;
-                entry.consecutiveFails = 0;
-            } catch (err) {
-                entry.fail++;
-                entry.consecutiveFails = (entry.consecutiveFails || 0) + 1;
-                console.error(`[Ping Error] URL: ${entry.url}, User: ${userId}, Error: ${err.message}`);
-
-                if (entry.consecutiveFails >= FAIL_LIMIT) {
-                    entry.active = false;
-                    stopSinglePing(userId, index); // Stop this specific interval
-                    bot.sendMessage(userId, `❌ **Auto-Stopped Pinging** ❌\n\nYour URL has been automatically stopped after ${FAIL_LIMIT} consecutive failures.\n\n🔗 **URL:** ${entry.url}\n\nYou can re-enable it from the dashboard.`, { parse_mode: 'Markdown' });
-                }
-            } finally {
-                saveUsers(); // Save state after each attempt
-            }
-        }, entry.interval * 1000);
-
-        pingIntervals[userId][index] = intervalId;
+        if (maintenanceUntil && maintenanceUntil > new Date()) text += `*Maintenance Mode Until:* ${maintenanceUntil.toLocaleString()}\n`;
+        
+        text += `*Last Ping:* ${formatTimeAgo(u.last_ping_time)}\n\n`;
+        buttons.push([{ text: `✏️ Edit ID ${u.id}`, callback_data: `edit_${u.id}` }]);
     });
-}
-
-
-// --- BOT UI & MENUS ---
-
-const mainMenu = {
-    reply_markup: {
-        inline_keyboard: [
-            [{ text: '➕ Add URL', callback_data: 'add_url' }],
-            [{ text: '🟢 Start Pinging', callback_data: 'start_ping' }, { text: '🔴 Stop Pinging', callback_data: 'stop_ping' }],
-            [{ text: '📊 Dashboard', callback_data: 'dashboard_0' }],
-            [{ text: '👑 Admin Panel', callback_data: 'admin_stats' }]
-        ]
-    }
+    
+    buttons.push([{ text: '🔙 Back to Menu', callback_data: 'menu' }]);
+    return { text, options: { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } } };
 };
 
-/**
- * Generates the dashboard view with pagination.
- * @param {string} userId - The user's ID.
- * @param {number} page - The current page number.
- * @returns {{text: string, options: object}}
- */
-const getDashboardPage = (userId, page = 0) => {
-    const user = users[userId];
-    const perPage = 3;
-    const urls = user.urls || [];
-    const start = page * perPage;
-    const end = start + perPage;
-    const totalPages = Math.ceil(urls.length / perPage) || 1;
+const getEditMenu = (urlId, urlText) => ({
+    text: `✏️ Editing URL: \`${urlText}\``,
+    options: {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⏯ Toggle Active/Pause', callback_data: `toggle_${urlId}` }],
+                [{ text: '⏱ Change Interval', callback_data: `set_interval_${urlId}` }],
+                [{ text: '🔎 Set Keyword', callback_data: `set_keyword_${urlId}` }],
+                [{ text: '📋 Set Headers', callback_data: `set_headers_${urlId}` }],
+                [{ text: '🛠 Set Maintenance', callback_data: `set_maintenance_${urlId}` }],
+                [{ text: '📜 View Event Log', callback_data: `view_log_${urlId}` }],
+                [{ text: '🗑️ Delete URL', callback_data: `delete_${urlId}` }],
+                [{ text: '🔙 Back to Dashboard', callback_data: 'dashboard' }]
+            ]
+        }
+    }
+});
 
-    const pageUrls = urls.slice(start, end);
+const getMaintenanceMenu = (urlId) => ({
+    text: '🛠 How long should maintenance mode be active?',
+    options: {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '1 Hour', callback_data: `maintenance_${urlId}_1` },
+                 { text: '8 Hours', callback_data: `maintenance_${urlId}_8` },
+                 { text: '1 Day', callback_data: `maintenance_${urlId}_24` }],
+                [{ text: 'Cancel Maintenance', callback_data: `maintenance_${urlId}_0` }],
+                [{ text: '🔙 Back to Edit Menu', callback_data: `edit_${urlId}` }]
+            ]
+        }
+    }
+});
 
-    const text = pageUrls.length > 0 ? pageUrls.map((u, i) => {
-        const globalIndex = start + i;
-        return `*URL ID: ${globalIndex}*\n` +
-               `🔗 *Link:* ${u.url}\n` +
-               `⏱ *Interval:* ${u.interval}s\n` +
-               `*Status:* ${u.active ? '🟢 Active' : '🔴 Inactive'}\n` +
-               `✅ *Success:* ${u.success || 0} | ❌ *Fail:* ${u.fail || 0}\n` +
-               `📅 *Last Ping:* ${formatTimeAgo(u.lastPing)}`;
-    }).join("\n\n") : '🚫 You have not added any URLs yet. Click "Add URL" to begin.';
+const getHelpText = () => `*ℹ️ Help & Information*\n\nThis bot monitors your websites for uptime and performance.\n\n*Features:*\n- *Dashboard:* View all your monitored URLs and their status.\n- *Pinging:* Checks your site at a set interval.\n- *Keyword Check:* Looks for a specific word on your page to confirm it's working correctly.\n- *SSL Monitoring:* Warns you 14 days before an SSL certificate expires.\n- *Maintenance Mode:* Pause alerts for a specific URL during maintenance.\n- *Custom Headers:* Monitor authenticated pages by providing an auth token or API key.\n- *Event Logs:* View the last 10 success/fail events for any URL.`;
 
-    const buttons = pageUrls.map((_, i) => {
-        const globalIndex = start + i;
-        return [
-            { text: `✏️ Edit ${globalIndex}`, callback_data: `edit_${globalIndex}` },
-            { text: `🗑️ Delete ${globalIndex}`, callback_data: `delete_${globalIndex}` }
-        ];
-    });
 
-    const navRow = [];
-    if (page > 0) navRow.push({ text: '⬅️ Previous', callback_data: `dashboard_${page - 1}` });
-    if (end < urls.length) navRow.push({ text: '➡️ Next', callback_data: `dashboard_${page + 1}` });
+bot.onText(/\/start|^\/menu$/, async (msg) => {
+    const userId = msg.from.id;
+    await dbRun('INSERT OR IGNORE INTO users (id) VALUES (?)', [userId]);
+    const { text, options } = getMainMenu("👋 Welcome to the Professional Ping Bot! I monitor your sites for uptime and performance.");
+    bot.sendMessage(userId, text, options);
+});
 
-    if (navRow.length > 0) buttons.push(navRow);
-    buttons.push([{ text: '🔙 Back to Menu', callback_data: 'menu' }]);
+bot.onText(/\/help/, (msg) => {
+    bot.sendMessage(msg.from.id, getHelpText(), { parse_mode: 'Markdown' });
+});
 
-    return {
-        text: `📊 *Your Dashboard (Page ${page + 1}/${totalPages})*:\n\n${text}`,
-        options: {
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: buttons }
+bot.on('callback_query', async (query) => {
+    const userId = query.from.id;
+    const [command, payload, ...args] = query.data.split('_');
+    await bot.answerCallbackQuery(query.id).catch(console.error);
+    const messageId = query.message.message_id;
+
+    const commandHandlers = {
+        'menu': async () => {
+            const { text, options } = getMainMenu();
+            bot.editMessageText(text, { chat_id: userId, message_id: messageId, ...options });
+        },
+        'dashboard': async () => {
+            const { text, options } = await getDashboardText(userId);
+            bot.editMessageText(text, { chat_id: userId, message_id: messageId, ...options });
+        },
+        'help': () => bot.editMessageText(getHelpText(), { chat_id: userId, message_id: messageId, parse_mode: 'Markdown', ...getMainMenu().options }),
+        'add': () => {
+            userStates.set(userId, { state: 'awaiting_url' });
+            bot.sendMessage(userId, '🔗 Please send the full URL you want to monitor (e.g., https://example.com):');
+        },
+        'edit': async () => {
+            const urlToEdit = await dbGet('SELECT * FROM urls WHERE id = ? AND user_id = ?', [payload, userId]);
+            if (urlToEdit) {
+                const { text, options } = getEditMenu(payload, urlToEdit.url);
+                bot.editMessageText(text, { chat_id: userId, message_id: messageId, ...options });
+            }
+        },
+        'toggle': async () => {
+            const urlToToggle = await dbGet('SELECT * FROM urls WHERE id = ? AND user_id = ?', [payload, userId]);
+            if (urlToToggle) {
+                const newStatus = urlToToggle.is_active ? 0 : 1;
+                await dbRun('UPDATE urls SET is_active = ? WHERE id = ?', [newStatus, payload]);
+                urlToToggle.is_active = newStatus;
+                if (newStatus === 1) startPinger(urlToToggle, bot); else stopPinger(payload);
+                await bot.answerCallbackQuery(query.id, { text: `Status set to ${newStatus ? 'Active' : 'Paused'}.` });
+                const { options } = getEditMenu(payload, urlToToggle.url);
+                bot.editMessageReplyMarkup(options.reply_markup, { chat_id: userId, message_id: messageId });
+            }
+        },
+        'set': () => {
+            const setState = args[0];
+            userStates.set(userId, { state: `awaiting_${payload}`, urlId: setState });
+            const messages = {
+                'interval': '⏱ Please send the new interval in seconds (e.g., 60):',
+                'keyword': '🔎 Please send the keyword to look for on the page.\nSend "none" to remove the keyword.',
+                'headers': '📋 Please send the custom headers as a JSON object.\nExample: `{"Authorization": "Bearer TOKEN"}`\nSend "none" to remove all headers.',
+                'maintenance': () => {
+                    const { text, options } = getMaintenanceMenu(setState);
+                    bot.editMessageText(text, { chat_id: userId, message_id: messageId, ...options });
+                }
+            };
+            if (typeof messages[payload] === 'function') messages[payload]();
+            else bot.sendMessage(userId, messages[payload], { parse_mode: 'Markdown'});
+        },
+        'maintenance': async () => {
+            const hours = parseInt(args[0], 10);
+            const maintenanceUntil = hours === 0 ? null : new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+            await dbRun('UPDATE urls SET maintenance_until = ? WHERE id = ?', [maintenanceUntil, payload]);
+            await bot.answerCallbackQuery(query.id, { text: `Maintenance mode ${hours === 0 ? 'cancelled' : `set for ${hours} hour(s)`}.`});
+            const urlToEdit = await dbGet('SELECT url FROM urls WHERE id = ?', [payload]);
+            const { text, options } = getEditMenu(payload, urlToEdit.url);
+            bot.editMessageText(text, { chat_id: userId, message_id: messageId, ...options });
+        },
+        'view': async () => {
+            if (payload === 'log') {
+                const logs = await dbAll('SELECT * FROM ping_logs WHERE url_id = ? ORDER BY timestamp DESC', [args[0]]);
+                let logText = logs.length ? '📜 *Recent Ping Events:*\n\n' : '📜 No log events found for this URL yet.';
+                logs.forEach(log => {
+                    logText += `${log.status === 'success' ? '✅' : '❌'} *${log.status.toUpperCase()}* (${log.status_code || 'N/A'}) - ${formatTimeAgo(log.timestamp)}\n   └─ Msg: \`${log.message}\`\n`;
+                });
+                bot.sendMessage(userId, logText, { parse_mode: 'Markdown' });
+            }
+        },
+        'delete': async () => {
+            const urlToDelete = await dbGet('SELECT url FROM urls WHERE id = ? AND user_id = ?', [payload, userId]);
+            if (urlToDelete) {
+                bot.deleteMessage(userId, messageId);
+                stopPinger(payload);
+                await dbRun('DELETE FROM urls WHERE id = ?', [payload]);
+                bot.sendMessage(userId, `🗑️ URL \`${urlToDelete.url}\` has been deleted.`);
+            }
         }
     };
-};
-
-// --- BOT EVENT HANDLERS ---
-
-bot.onText(/\/start/, (msg) => {
-    const userId = msg.from.id.toString();
-    if (!users[userId]) {
-        users[userId] = { urls: [] };
-        saveUsers();
-    }
-    bot.sendMessage(userId, "👋 Welcome to the Auto Ping Bot!\n\nI can monitor your web projects by pinging them at set intervals to keep them awake. Use the menu below to get started.", mainMenu);
+    if (commandHandlers[command]) await commandHandlers[command]();
 });
 
-bot.on('callback_query', (query) => {
-    const userId = query.from.id.toString();
-    const [command, payload] = query.data.split('_');
+bot.on('message', async (msg) => {
+    const userId = msg.from.id;
+    if (msg.text.startsWith('/') || !userStates.has(userId)) return;
 
-    if (!users[userId]) {
-        users[userId] = { urls: [] };
-        saveUsers();
-    }
-    const user = users[userId];
+    const { state, urlId } = userStates.get(userId);
+    const text = msg.text;
 
-    bot.answerCallbackQuery(query.id); // Acknowledge the button press immediately
+    const stateHandlers = {
+        'awaiting_url': async () => {
+            new URL(text);
+            const { lastID } = await dbRun('INSERT INTO urls (user_id, url) VALUES (?, ?)', [userId, text]);
+            const newUrl = await dbGet('SELECT * FROM urls WHERE id = ?', [lastID]);
+            startPinger(newUrl, bot);
+            bot.sendMessage(userId, '✅ URL added and is now being monitored!');
+        },
+        'awaiting_interval': async () => {
+            const interval = parseInt(text, 10);
+            if (isNaN(interval) || interval < 30) throw new Error('❌ Invalid input. Please send a number equal to or greater than 30.');
+            await dbRun('UPDATE urls SET interval = ? WHERE id = ?', [interval, urlId]);
+            const updatedUrl = await dbGet('SELECT * FROM urls WHERE id = ?', [urlId]);
+            startPinger(updatedUrl, bot);
+            bot.sendMessage(userId, `✅ Interval for URL ID ${urlId} has been updated to ${interval} seconds.`);
+        },
+        'awaiting_keyword': async () => {
+            const keyword = text.toLowerCase() === 'none' ? null : text;
+            await dbRun('UPDATE urls SET keyword = ? WHERE id = ?', [keyword, urlId]);
+            bot.sendMessage(userId, `✅ Keyword for URL ID ${urlId} has been ${keyword ? `set to "${keyword}"` : 'removed'}.`);
+        },
+        'awaiting_headers': async () => {
+            const headers = text.toLowerCase() === 'none' ? null : text;
+            if (headers) JSON.parse(headers); // Validate JSON
+            await dbRun('UPDATE urls SET headers = ? WHERE id = ?', [headers, urlId]);
+            bot.sendMessage(userId, `✅ Headers for URL ID ${urlId} have been updated.`);
+        }
+    };
 
-    switch (command) {
-        case 'menu':
-            bot.editMessageText('🏠 Main Menu:', { chat_id: query.message.chat.id, message_id: query.message.message_id, ...mainMenu });
-            break;
-
-        case 'add': // 'add_url'
-            bot.sendMessage(userId, '🔗 Please send me the full URL you want to ping (e.g., https://example.com):');
-            bot.once('message', (msg) => {
-                const urlToAdd = msg.text;
-                try {
-                    new URL(urlToAdd);
-                    user.urls.push({ url: urlToAdd, interval: 300, active: true, lastPing: null, success: 0, fail: 0, consecutiveFails: 0 });
-                    saveUsers();
-                    bot.sendMessage(userId, '✅ URL added successfully with a default interval of 300 seconds. You can change this in the dashboard.', mainMenu);
-                } catch (error) {
-                    bot.sendMessage(userId, '❌ Invalid URL format. Please make sure it starts with http:// or https://', mainMenu);
-                }
-            });
-            break;
-
-        case 'start': // 'start_ping'
-            user.urls.forEach(u => u.active = true);
-            saveUsers();
-            startUserPings(userId);
-            bot.sendMessage(userId, '🟢 Pinging started for all active URLs!', mainMenu);
-            break;
-
-        case 'stop': // 'stop_ping'
-            user.urls.forEach(u => u.active = false);
-            saveUsers();
-            stopUserPings(userId);
-            bot.sendMessage(userId, '🔴 Pinging stopped for all URLs.', mainMenu);
-            break;
-
-        case 'dashboard':
-            const page = parseInt(payload || '0', 10);
-            const dash = getDashboardPage(userId, page);
-            bot.editMessageText(dash.text, { chat_id: query.message.chat.id, message_id: query.message.message_id, ...dash.options });
-            break;
-
-        case 'edit':
-            const editIndex = parseInt(payload, 10);
-            if (user.urls[editIndex]) {
-                bot.sendMessage(userId, `✏️ The current interval for this URL is ${user.urls[editIndex].interval}s.\n\nEnter the new interval in seconds (minimum ${MIN_INTERVAL}):`);
-                bot.once('message', (msg) => {
-                    const newInterval = parseInt(msg.text, 10);
-                    if (!isNaN(newInterval) && newInterval >= MIN_INTERVAL) {
-                        user.urls[editIndex].interval = newInterval;
-                        saveUsers();
-                        startUserPings(userId);
-                        bot.sendMessage(userId, '✅ Interval updated! Pings have been restarted.', mainMenu);
-                    } else {
-                        bot.sendMessage(userId, `❌ Invalid interval. Please enter a number greater than or equal to ${MIN_INTERVAL}.`, mainMenu);
-                    }
-                });
-            }
-            break;
-
-        case 'delete':
-            const deleteIndex = parseInt(payload, 10);
-            if (user.urls[deleteIndex]) {
-                const deletedUrl = user.urls[deleteIndex].url;
-                stopSinglePing(userId, deleteIndex);
-                user.urls.splice(deleteIndex, 1);
-                saveUsers();
-                startUserPings(userId);
-                bot.sendMessage(userId, `🗑️ URL removed successfully:\n${deletedUrl}`, mainMenu);
-            }
-            break;
-
-        case 'admin': // 'admin_stats'
-            if (userId !== ADMIN_ID) {
-                bot.sendMessage(userId, '🚫 You are not authorized to view this.');
-                return;
-            }
-            const totalUsers = Object.keys(users).length;
-            const allUrls = Object.values(users).flatMap(u => u.urls);
-            const totalUrls = allUrls.length;
-            const activeUrls = allUrls.filter(u => u.active).length;
-            const totalSuccess = allUrls.reduce((sum, url) => sum + (url.success || 0), 0);
-            const totalFail = allUrls.reduce((sum, url) => sum + (url.fail || 0), 0);
-            bot.sendMessage(userId, `👑 *Admin Stats*\n\n👤 *Total Users:* ${totalUsers}\n🔗 *Total URLs:* ${totalUrls}\n🟢 *Active URLs:* ${activeUrls}\n\n✅ *Total Success Pings:* ${totalSuccess}\n❌ *Total Failed Pings:* ${totalFail}`, { parse_mode: 'Markdown' });
-            break;
+    try {
+        if(stateHandlers[state]) await stateHandlers[state]();
+    } catch (e) {
+        console.error("State machine error:", e);
+        bot.sendMessage(userId, e.message.startsWith('❌') ? e.message : "An error occurred. Please try again.");
+    } finally {
+        userStates.delete(userId);
     }
 });
 
-// --- BOT & PINGER STARTUP ---
-console.log("Bot starting up...");
 
-for (const userId in users) {
-    if (users[userId].urls && users[userId].urls.some(u => u.active)) {
-        console.log(`Initializing pings for user ${userId}`);
-        startUserPings(userId);
-    }
-}
-
-if (SELF_PING_URL) {
-    setInterval(() => {
-        axios.get(SELF_PING_URL)
-            .then(() => console.log('🌐 Self-ping successful.'))
-            .catch((err) => console.error('🌐 Self-ping failed:', err.message));
-    }, 5 * 60 * 1000);
-    console.log(`Self-pinging enabled for: ${SELF_PING_URL}`);
-}
-
-// --- WEB SERVER FOR HOSTING ---
-// This part is crucial for platforms like Render, Heroku, etc.
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is alive.');
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' }).end('Bot is running.');
+}).listen(PORT, () => {
+    console.log(`🚀 Server listening on port ${PORT}`);
+    initializeAllPingers(bot);
+    checkAllSslCertificates(bot);
+    setInterval(() => checkAllSslCertificates(bot), 24 * 60 * 60 * 1000);
 });
 
-server.listen(PORT, () => {
-    console.log(`🚀 Server is listening on port ${PORT}`);
-    console.log("✅ Bot is running and polling for messages.");
-});
+console.log("✅ Bot is polling for messages.");
 
+bot.on('polling_error', console.error);
