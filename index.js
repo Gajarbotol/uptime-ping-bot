@@ -3,11 +3,13 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const axios = require('axios');
+const http = require('http'); // 👈 Added http module
 
 // --- CONFIGURATION ---
 const token = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID;
 const SELF_PING_URL = process.env.SELF_PING_URL || null; // e.g., your Glitch/Render URL
+const PORT = process.env.PORT || 3000; // 👈 Added port configuration
 const DATA_FILE = './users.json';
 const FAIL_LIMIT = 5; // Auto-stop URL after this many consecutive fails
 const MIN_INTERVAL = 4; // Minimum allowed ping interval in seconds
@@ -178,7 +180,7 @@ const getDashboardPage = (userId, page = 0) => {
                `⏱ *Interval:* ${u.interval}s\n` +
                `*Status:* ${u.active ? '🟢 Active' : '🔴 Inactive'}\n` +
                `✅ *Success:* ${u.success || 0} | ❌ *Fail:* ${u.fail || 0}\n` +
-               `📅 *Last Ping:* ${formatTimeAgo(u.lastPing)}`; // <-- MODIFIED LINE
+               `📅 *Last Ping:* ${formatTimeAgo(u.lastPing)}`;
     }).join("\n\n") : '🚫 You have not added any URLs yet. Click "Add URL" to begin.';
 
     const buttons = pageUrls.map((_, i) => {
@@ -333,4 +335,15 @@ if (SELF_PING_URL) {
     console.log(`Self-pinging enabled for: ${SELF_PING_URL}`);
 }
 
-console.log("✅ Bot is running and polling for messages.");
+// --- WEB SERVER FOR HOSTING ---
+// This part is crucial for platforms like Render, Heroku, etc.
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is alive.');
+});
+
+server.listen(PORT, () => {
+    console.log(`🚀 Server is listening on port ${PORT}`);
+    console.log("✅ Bot is running and polling for messages.");
+});
+
