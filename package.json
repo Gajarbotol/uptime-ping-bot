@@ -1,15 +1,21 @@
 {
-  "name": "telegram-ping-bot",
-  "version": "1.0.0",
-  "description": "A Telegram bot to automatically ping URLs to keep them active.",
+  "name": "pro-telegram-ping-bot",
+  "version": "3.0.0",
+  "description": "A professional Telegram bot to monitor URL uptime with a database, logging, and advanced features.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.7.2",
-    "node-telegram-bot-api": "^0.66.0"
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
   }
 }
